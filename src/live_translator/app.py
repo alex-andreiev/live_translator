@@ -5,19 +5,18 @@ Live Translator - Real-time speech-to-text translation
 import sys
 import threading
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 
-from audio_capture import AudioCapture
-from transcriber import Transcriber
-from translator import Translator
-from overlay import CaptionOverlay
-from settings import get_settings
-from logger import get_logger
-from qa_assistant import QAAssistant
-from reverse_mode import ReverseMode
+from live_translator.audio import AudioCapture
+from live_translator.processing import Transcriber, Translator
+from live_translator.ui import CaptionOverlay
+from live_translator.utils import get_settings, get_logger
+from live_translator.ai import QAAssistant
+from live_translator.modes import ReverseTranslationMode
 
 
 class LiveTranslatorApp(Gtk.Application):
@@ -35,6 +34,8 @@ class LiveTranslatorApp(Gtk.Application):
         self.running = False
         self.processing_thread = None
         self.processed_questions = set()  # Track already processed questions
+        # Thread pool for translation tasks (limit concurrent threads)
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="translate")
 
     def do_activate(self):
         if not self.window:
@@ -64,9 +65,9 @@ class LiveTranslatorApp(Gtk.Application):
         Returns:
             True if languages match, False otherwise
         """
-        # Language code to name mapping
+        # Language code to name mapping (bidirectional for exact matching)
         lang_map = {
-            'en': ['english', 'en-us', 'en-gb'],
+            'en': ['english'],
             'ru': ['russian'],
             'uk': ['ukrainian'],
             'es': ['spanish'],
@@ -76,36 +77,50 @@ class LiveTranslatorApp(Gtk.Application):
             'pt': ['portuguese'],
             'nl': ['dutch'],
             'pl': ['polish'],
-            'zh': ['chinese', 'simplified chinese', 'traditional chinese'],
+            'zh': ['chinese'],
             'ja': ['japanese'],
             'ko': ['korean'],
         }
-        
+
+        # Reverse mapping: name -> code
+        name_to_code = {}
+        for code, names in lang_map.items():
+            for name in names:
+                name_to_code[name] = code
+
         if not detected_lang:
             return False
-        
+
         detected_lower = detected_lang.lower().split('-')[0]  # Get main language code
-        target_lower = target_lang.lower()
-        
-        # Direct match with target language
-        if detected_lower == target_lower:
+        target_lower = target_lang.lower().strip()
+
+        # Normalize target to code if it's a full name
+        target_code = name_to_code.get(target_lower, target_lower)
+
+        # Direct exact match with target language code
+        if detected_lower == target_code:
             return True
-        
-        # Check against language map for target language
-        for code, names in lang_map.items():
-            if detected_lower == code and any(name in target_lower for name in names):
+
+        # Check if detected code maps to target name (exact match)
+        if detected_lower in lang_map:
+            detected_names = lang_map[detected_lower]
+            if target_lower in detected_names:
                 return True
-        
-        # If expected languages provided, check if detected language is in the list
+
+        # If expected languages provided, check if detected language matches any expected
         if expected_langs:
-            expected_lower = [lang.lower() for lang in expected_langs]
-            for code, names in lang_map.items():
-                if detected_lower == code:
-                    # Check if any of the language names match expected languages
-                    for name in names:
-                        if any(name in exp_lang for exp_lang in expected_lower):
-                            return False  # Language is in expected list but not target, don't translate
-        
+            for exp_lang in expected_langs:
+                exp_lower = exp_lang.lower().strip()
+                exp_code = name_to_code.get(exp_lower, exp_lower)
+
+                # Check if detected matches this expected language
+                if detected_lower == exp_code:
+                    # Detected is in expected list - check if it's the target
+                    if exp_code == target_code or exp_lower == target_lower:
+                        return True  # Language matches target
+                    else:
+                        return False  # Language is expected but not target, skip translation
+
         return False
 
     def _initialize(self):
@@ -247,21 +262,13 @@ class LiveTranslatorApp(Gtk.Application):
                                 GLib.idle_add(self.window.set_translated_text, "[Same language - no translation needed]")
                                 self.logger.log_translated("[Same language - no translation needed]")
                             else:
-                                # Translate in background
-                                threading.Thread(
-                                    target=self._translate_and_display,
-                                    args=(text,),
-                                    daemon=True
-                                ).start()
+                                # Translate in background using thread pool
+                                self._executor.submit(self._translate_and_display, text)
 
                             # Auto-detect questions if enabled
                             if (self.qa_assistant and
                                 self.settings.get("ai_assistant", "auto_detect_questions", True)):
-                                threading.Thread(
-                                    target=self._detect_and_answer_questions,
-                                    args=(text,),
-                                    daemon=True
-                                ).start()
+                                self._executor.submit(self._detect_and_answer_questions, text)
                     else:
                         # Plain text output
                         text = result
@@ -275,21 +282,13 @@ class LiveTranslatorApp(Gtk.Application):
                                 GLib.idle_add(self.window.set_translated_text, "[Same language - no translation needed]")
                                 self.logger.log_translated("[Same language - no translation needed]")
                             else:
-                                # Translate in background
-                                threading.Thread(
-                                    target=self._translate_and_display,
-                                    args=(text,),
-                                    daemon=True
-                                ).start()
+                                # Translate in background using thread pool
+                                self._executor.submit(self._translate_and_display, text)
 
                             # Auto-detect questions if enabled
                             if (self.qa_assistant and
                                 self.settings.get("ai_assistant", "auto_detect_questions", True)):
-                                threading.Thread(
-                                    target=self._detect_and_answer_questions,
-                                    args=(text,),
-                                    daemon=True
-                                ).start()
+                                self._executor.submit(self._detect_and_answer_questions, text)
 
     def _format_diarized_text(self, segments):
         """Format diarized segments for logging."""
@@ -322,7 +321,7 @@ class LiveTranslatorApp(Gtk.Application):
             # Use same translation model
             translator_model = self.settings.get("translation", "model", "mistral:7b")
             
-            self.reverse_mode = ReverseMode(
+            self.reverse_mode = ReverseTranslationMode(
                 whisper_model=whisper_model,
                 whisper_device=whisper_device,
                 whisper_compute_type=whisper_compute,
@@ -535,6 +534,15 @@ class LiveTranslatorApp(Gtk.Application):
 
     def do_shutdown(self):
         self.running = False
+
+        # Wait for processing thread to finish
+        if self.processing_thread:
+            self.processing_thread.join(timeout=2.0)
+
+        # Shutdown thread pool executor
+        if self._executor:
+            self._executor.shutdown(wait=False)
+
         if self.audio_capture:
             self.audio_capture.stop()
         if self.reverse_mode:

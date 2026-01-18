@@ -2,7 +2,8 @@
 QA Assistant module for AI-powered learning help
 """
 import re
-import ollama
+import threading
+from live_translator.ai.api_client import APIClient
 
 # Question detection patterns
 QUESTION_PATTERNS = [
@@ -80,6 +81,9 @@ class QAAssistant:
         self.source_language = source_language
         self.target_language = target_language
 
+        # Use shared API client with timeout
+        self._client = APIClient(provider=provider, model=model, timeout=30)
+
         # Prompt templates
         self.qa_prompt = QA_PROMPT
         self.summary_prompt = SUMMARY_PROMPT
@@ -104,6 +108,8 @@ class QAAssistant:
             self.summary_prompt = summary_prompt
         if learning_prompt:
             self.learning_prompt = learning_prompt
+        # Update API client settings
+        self._client.set_settings(provider=provider, model=model)
 
     def detect_questions(self, text):
         """
@@ -249,55 +255,9 @@ class QAAssistant:
     def _generate_response(self, prompt):
         """Generate response using configured provider."""
         try:
-            if self.provider == "ollama":
-                return self._generate_ollama(prompt)
-            elif self.provider == "openai":
-                return self._generate_openai(prompt)
-            elif self.provider == "anthropic":
-                return self._generate_anthropic(prompt)
-            else:
-                print(f"Unknown provider: {self.provider}")
-                return None
+            return self._client.generate(prompt)
         except Exception as e:
             print(f"Response generation error: {e}")
-            return None
-
-    def _generate_ollama(self, prompt):
-        """Generate response using Ollama."""
-        response = ollama.generate(
-            model=self.model,
-            prompt=prompt,
-            stream=False
-        )
-        return response['response'].strip()
-
-    def _generate_openai(self, prompt):
-        """Generate response using OpenAI API."""
-        try:
-            import openai
-            client = openai.OpenAI()
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.choices[0].message.content.strip()
-        except ImportError:
-            print("OpenAI package not installed. Run: pip install openai")
-            return None
-
-    def _generate_anthropic(self, prompt):
-        """Generate response using Anthropic API."""
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.content[0].text.strip()
-        except ImportError:
-            print("Anthropic package not installed. Run: pip install anthropic")
             return None
 
     def _translate_response(self, text):
@@ -345,13 +305,18 @@ Output ONLY the translation, nothing else:
         }
 
 
-# Global instance
+# Global instance with thread-safe initialization
 _qa_assistant = None
+_qa_assistant_lock = threading.Lock()
+
 
 def get_qa_assistant():
     global _qa_assistant
     if _qa_assistant is None:
-        _qa_assistant = QAAssistant()
+        with _qa_assistant_lock:
+            # Double-check locking pattern
+            if _qa_assistant is None:
+                _qa_assistant = QAAssistant()
     return _qa_assistant
 
 

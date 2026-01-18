@@ -1,7 +1,8 @@
 """
 Translation module using Ollama or other providers
 """
-import ollama
+from live_translator.ai import APIClient
+
 
 class Translator:
     def __init__(self, provider="ollama", model="mistral:7b", target_language="Russian", prompt=None):
@@ -21,6 +22,8 @@ class Translator:
             "Translate the following text to {target_language}. "
             "Output ONLY the translation, nothing else:\n\n{text}"
         )
+        # Use shared API client with timeout
+        self._client = APIClient(provider=provider, model=model, timeout=30)
 
     def set_settings(self, provider=None, model=None, target_language=None, prompt=None):
         """Update translator settings."""
@@ -32,6 +35,8 @@ class Translator:
             self.target_language = target_language
         if prompt:
             self.prompt_template = prompt
+        # Update API client settings
+        self._client.set_settings(provider=provider, model=model)
 
     def translate(self, text):
         """
@@ -52,55 +57,9 @@ class Translator:
         )
 
         try:
-            if self.provider == "ollama":
-                return self._translate_ollama(prompt)
-            elif self.provider == "openai":
-                return self._translate_openai(prompt)
-            elif self.provider == "anthropic":
-                return self._translate_anthropic(prompt)
-            else:
-                print(f"Unknown provider: {self.provider}")
-                return None
+            return self._client.generate(prompt)
         except Exception as e:
             print(f"Translation error: {e}")
-            return None
-
-    def _translate_ollama(self, prompt):
-        """Translate using Ollama."""
-        response = ollama.generate(
-            model=self.model,
-            prompt=prompt,
-            stream=False
-        )
-        return response['response'].strip()
-
-    def _translate_openai(self, prompt):
-        """Translate using OpenAI API."""
-        try:
-            import openai
-            client = openai.OpenAI()
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.choices[0].message.content.strip()
-        except ImportError:
-            print("OpenAI package not installed. Run: pip install openai")
-            return None
-
-    def _translate_anthropic(self, prompt):
-        """Translate using Anthropic API."""
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.content[0].text.strip()
-        except ImportError:
-            print("Anthropic package not installed. Run: pip install anthropic")
             return None
 
 

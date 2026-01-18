@@ -61,7 +61,13 @@ class VirtualOutput:
                 )
                 
                 if result.returncode == 0:
-                    self._module_id = int(result.stdout.strip())
+                    # Validate module ID is numeric before conversion
+                    module_id_str = result.stdout.strip()
+                    if module_id_str.isdigit():
+                        self._module_id = int(module_id_str)
+                    else:
+                        print(f"Warning: Unexpected module ID format: {module_id_str}")
+                        self._module_id = None
                     self._monitor_source = f"{self.sink_name}.monitor"
                     self._is_active = True
                     print(f"Created virtual sink: {self.sink_name}")

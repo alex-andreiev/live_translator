@@ -7,7 +7,7 @@ gi.require_version('Gdk', '4.0')
 from gi.repository import Gtk, Gdk, GLib, Pango
 import threading
 
-from settings import get_settings
+from live_translator.utils import get_settings
 
 class CaptionOverlay(Gtk.ApplicationWindow):
     def __init__(self, app):
@@ -98,6 +98,9 @@ class CaptionOverlay(Gtk.ApplicationWindow):
         # History storage
         self.original_history = []
         self.translated_history = []
+
+        # Settings dialog reference (prevent multiple instances)
+        self._settings_dialog = None
 
         # AI Assistant panel (initially hidden)
         self._create_ai_panel()
@@ -365,9 +368,19 @@ class CaptionOverlay(Gtk.ApplicationWindow):
 
     def _on_settings_clicked(self, button):
         """Open settings dialog."""
-        from settings_dialog import SettingsDialog
-        dialog = SettingsDialog(self, on_apply_callback=self._on_settings_applied)
-        dialog.present()
+        # Prevent multiple dialog instances
+        if self._settings_dialog is not None:
+            self._settings_dialog.present()
+            return
+
+        from live_translator.ui.settings_dialog import SettingsDialog
+
+        def on_dialog_closed(dialog):
+            self._settings_dialog = None
+
+        self._settings_dialog = SettingsDialog(self, on_apply_callback=self._on_settings_applied)
+        self._settings_dialog.connect("close-request", lambda d: on_dialog_closed(d))
+        self._settings_dialog.present()
 
     def _on_settings_applied(self, settings):
         """Called when settings are applied."""

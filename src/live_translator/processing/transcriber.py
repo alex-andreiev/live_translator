@@ -1,6 +1,7 @@
 """
 Speech-to-text module using Faster-Whisper with local speaker diarization
 """
+import threading
 import numpy as np
 from faster_whisper import WhisperModel
 from sklearn.cluster import AgglomerativeClustering
@@ -46,6 +47,7 @@ class Transcriber:
         print("Model loaded.")
 
         self.audio_buffer = []
+        self._buffer_lock = threading.RLock()  # Reentrant lock for thread safety
         self.min_audio_length = min_audio_length
         self.beam_size = beam_size
         self.min_silence_duration_ms = min_silence_duration_ms
@@ -97,13 +99,21 @@ class Transcriber:
             self.enable_diarization = enabled
 
     def add_audio(self, audio_chunk):
-        """Add audio chunk to buffer."""
-        self.audio_buffer.append(audio_chunk)
+        """Add audio chunk to buffer (thread-safe)."""
+        with self._buffer_lock:
+            self.audio_buffer.append(audio_chunk)
+            # Limit buffer to 30 seconds max to prevent OOM
+            max_samples = self.sample_rate * 30
+            total_samples = sum(len(chunk) for chunk in self.audio_buffer)
+            while total_samples > max_samples and len(self.audio_buffer) > 1:
+                removed = self.audio_buffer.pop(0)
+                total_samples -= len(removed)
 
     def get_buffer_duration(self):
-        """Get current buffer duration in seconds."""
-        total_samples = sum(len(chunk) for chunk in self.audio_buffer)
-        return total_samples / self.sample_rate
+        """Get current buffer duration in seconds (thread-safe)."""
+        with self._buffer_lock:
+            total_samples = sum(len(chunk) for chunk in self.audio_buffer)
+            return total_samples / self.sample_rate
 
     def _get_speaker_for_embedding(self, embedding):
         """
@@ -122,10 +132,13 @@ class Transcriber:
         threshold = 0.75  # Similarity threshold for same speaker
 
         for speaker_num, centroid in self.speaker_centroids.items():
-            # Cosine similarity
-            similarity = np.dot(embedding, centroid) / (
-                np.linalg.norm(embedding) * np.linalg.norm(centroid)
-            )
+            # Cosine similarity with zero-norm protection
+            embedding_norm = np.linalg.norm(embedding)
+            centroid_norm = np.linalg.norm(centroid)
+            if embedding_norm > 0 and centroid_norm > 0:
+                similarity = np.dot(embedding, centroid) / (embedding_norm * centroid_norm)
+            else:
+                similarity = 0.0  # Treat zero-norm vectors as dissimilar
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_speaker = speaker_num
@@ -156,12 +169,17 @@ class Transcriber:
         if self.get_buffer_duration() < self.min_audio_length:
             return None
 
-        # Combine audio chunks
-        audio = np.concatenate(self.audio_buffer)
-        self.audio_buffer = []
+        # Combine audio chunks and clear buffer (thread-safe)
+        with self._buffer_lock:
+            if not self.audio_buffer:
+                return None
+            audio = np.concatenate(self.audio_buffer)
+            self.audio_buffer = []
 
         # Check if audio has enough energy (not silence)
-        if np.abs(audio).max() < 0.01:
+        # Use RMS-based detection which is more accurate for speech
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms < 0.005:  # Lower threshold, RMS is typically smaller than peak
             return None
 
         # Transcribe with Whisper
@@ -233,12 +251,13 @@ class Transcriber:
                     except Exception as e:
                         print(f"Embedding error: {e}")
 
-                # If no embedding could be extracted, use last known speaker or default
+                # If no embedding could be extracted, mark as unknown speaker
                 if speaker_num is None:
-                    if self.speaker_centroids:
-                        speaker_num = max(self.speaker_centroids.keys())
-                    else:
-                        speaker_num = 1
+                    results.append({
+                        "speaker": "Unknown",
+                        "text": text
+                    })
+                    continue
 
                 results.append({
                     "speaker": f"Speaker {speaker_num}",
@@ -265,8 +284,9 @@ class Transcriber:
         self.embedding_history.clear()
 
     def clear_buffer(self):
-        """Clear the audio buffer."""
-        self.audio_buffer = []
+        """Clear the audio buffer (thread-safe)."""
+        with self._buffer_lock:
+            self.audio_buffer = []
 
 
 if __name__ == "__main__":

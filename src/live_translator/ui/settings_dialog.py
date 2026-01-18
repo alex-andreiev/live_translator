@@ -6,7 +6,7 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, Gdk, GLib
 import threading
 
-from settings import get_settings
+from live_translator.utils import get_settings
 
 
 def get_ollama_models():
@@ -1115,14 +1115,61 @@ class SettingsDialog(Gtk.Window):
         self.settings.set("reverse_translation", "tts_speed", self.reverse_tts_speed_scale.get_value())
         self.settings.set("reverse_translation", "virtual_sink_name", self.reverse_sink_name_entry.get_text())
 
+    def _validate_settings(self):
+        """Validate all settings before applying."""
+        errors = []
+
+        # Validate target language
+        target_lang = self.target_lang_entry.get_text().strip()
+        if not target_lang:
+            errors.append("Target language cannot be empty")
+
+        # Validate source language
+        source_lang = self.source_lang_entry.get_text().strip()
+        if not source_lang:
+            errors.append("Source language cannot be empty")
+
+        # Validate log path
+        log_path = self.log_path_entry.get_text().strip()
+        if not log_path:
+            errors.append("Log path cannot be empty")
+
+        # Validate virtual sink name for reverse translation
+        sink_name = self.reverse_sink_name_entry.get_text().strip()
+        if not sink_name:
+            errors.append("Virtual sink name cannot be empty")
+
+        return errors
+
+    def _show_validation_errors(self, errors):
+        """Show validation error dialog."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="Validation Errors"
+        )
+        dialog.format_secondary_text("\n".join(errors))
+        dialog.connect("response", lambda d, r: d.destroy())
+        dialog.present()
+
     def _on_apply(self, button):
         """Apply settings without saving."""
+        errors = self._validate_settings()
+        if errors:
+            self._show_validation_errors(errors)
+            return
         self._collect_settings()
         if self.on_apply_callback:
             self.on_apply_callback(self.settings)
 
     def _on_save(self, button):
         """Save settings and close."""
+        errors = self._validate_settings()
+        if errors:
+            self._show_validation_errors(errors)
+            return
         self._collect_settings()
         self.settings.save()
         if self.on_apply_callback:

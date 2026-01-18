@@ -7,19 +7,14 @@ Pipeline: Microphone → Whisper STT → Ollama Translate → Piper TTS → Virt
 """
 
 import threading
-import time
-import queue
 import numpy as np
 from typing import Optional, Callable
 
-from mic_capture import MicCapture
-from transcriber import Transcriber
-from translator import Translator
-from tts_engine import TTSEngine
-from virtual_output import VirtualOutput
+from live_translator.audio import MicCapture, VirtualOutput
+from live_translator.processing import Transcriber, Translator, TTSEngine
 
 
-class ReverseMode:
+class ReverseTranslationMode:
     """
     Coordinates the reverse translation pipeline:
     Your speech → Recognition → Translation → Synthesis → Virtual Microphone
@@ -70,9 +65,8 @@ class ReverseMode:
         
         # Microphone capture
         self.mic = MicCapture(
-            device_name=input_device,
-            sample_rate=sample_rate,
-            channels=1
+            device=input_device,
+            sample_rate=sample_rate
         )
         
         # Speech recognition (reuse existing transcriber)
@@ -98,11 +92,9 @@ class ReverseMode:
             )
         )
         
-        # Text-to-Speech
-        self.tts = TTSEngine(engine=tts_engine)
-        if tts_voice:
-            self.tts.set_voice(tts_voice)
-        self.tts.set_speed(tts_speed)
+        # Text-to-Speech (voice parameter selects the voice model)
+        self.tts = TTSEngine(voice=tts_voice if tts_voice else 'en_US-lessac-medium')
+        self.tts_speed = tts_speed  # Store speed for potential future use
         
         # Virtual output
         self.virtual_output = VirtualOutput(
@@ -115,7 +107,6 @@ class ReverseMode:
         self._running = False
         self._paused = False
         self._process_thread: Optional[threading.Thread] = None
-        self._audio_queue = queue.Queue()
         
         # Callbacks
         self._on_transcription: Optional[Callable[[str], None]] = None
@@ -152,52 +143,43 @@ class ReverseMode:
         """
         if self._running:
             return True
-        
+
         # Create virtual output sink
         if not self.virtual_output.create_virtual_sink():
             self._notify_error("Failed to create virtual microphone")
             return False
-        
+
         # Start microphone capture
-        def audio_callback(audio_data: np.ndarray):
-            if not self._paused:
-                self._audio_queue.put(audio_data)
-        
-        if not self.mic.start(callback=audio_callback):
-            self._notify_error("Failed to start microphone capture")
+        try:
+            self.mic.start()
+        except Exception as e:
+            self._notify_error(f"Failed to start microphone capture: {e}")
             self.virtual_output.destroy_virtual_sink()
             return False
-        
+
         # Start processing thread
         self._running = True
         self._process_thread = threading.Thread(target=self._process_loop, daemon=True)
         self._process_thread.start()
-        
+
         print("Reverse translation started")
         return True
     
     def stop(self):
         """Stop reverse translation."""
         self._running = False
-        
+
         # Stop microphone
         self.mic.stop()
-        
-        # Clear queue
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except queue.Empty:
-                break
-        
+
         # Wait for processing thread
         if self._process_thread:
             self._process_thread.join(timeout=2.0)
             self._process_thread = None
-        
+
         # Destroy virtual sink
         self.virtual_output.destroy_virtual_sink()
-        
+
         print("Reverse translation stopped")
     
     def pause(self):
@@ -224,33 +206,37 @@ class ReverseMode:
         buffer_duration = 0.0
         min_chunk_duration = 1.0  # Process at least 1 second of audio
         max_chunk_duration = 5.0  # Process max 5 seconds at a time
-        
+
         while self._running:
             try:
-                # Get audio from queue with timeout
-                try:
-                    audio_chunk = self._audio_queue.get(timeout=0.1)
-                except queue.Empty:
+                # Get audio from mic capture queue
+                audio_chunk = self.mic.get_audio(timeout=0.1)
+                if audio_chunk is None:
                     # If we have buffered audio and queue is empty, process it
                     if audio_buffer and buffer_duration >= min_chunk_duration:
-                        self._process_audio_chunk(audio_buffer, buffer_duration)
+                        if not self._paused:
+                            self._process_audio_chunk(audio_buffer, buffer_duration)
                         audio_buffer = []
                         buffer_duration = 0.0
                     continue
-                
+
+                # Skip if paused
+                if self._paused:
+                    continue
+
                 # Add to buffer
                 audio_buffer.append(audio_chunk)
                 chunk_duration = len(audio_chunk) / self.sample_rate
                 buffer_duration += chunk_duration
                 self.stats['audio_chunks'] += 1
                 self.stats['total_audio_seconds'] += chunk_duration
-                
+
                 # Process if buffer is large enough
                 if buffer_duration >= max_chunk_duration:
                     self._process_audio_chunk(audio_buffer, buffer_duration)
                     audio_buffer = []
                     buffer_duration = 0.0
-                    
+
             except Exception as e:
                 self.stats['errors'] += 1
                 self._notify_error(f"Processing error: {e}")
@@ -263,9 +249,18 @@ class ReverseMode:
         try:
             # Combine audio chunks
             audio = np.concatenate(audio_chunks)
-            
+
             # Step 1: Transcribe (speech to text)
-            text = self.transcriber.transcribe(audio)
+            # Add audio to transcriber buffer then transcribe
+            self.transcriber.add_audio(audio)
+            result = self.transcriber.transcribe()
+
+            # Handle both diarized (list) and plain text results
+            if isinstance(result, list):
+                text = " ".join([seg.get("text", "") for seg in result])
+            else:
+                text = result
+
             if not text or not text.strip():
                 return
             
@@ -286,12 +281,17 @@ class ReverseMode:
             
             # Step 3: Synthesize speech
             audio_data = self.tts.synthesize(translated)
-            if not audio_data:
+            if audio_data is None:
                 self._notify_error("TTS synthesis failed")
                 return
-            
+
+            # Convert numpy float32 array to bytes (16-bit signed, little-endian)
+            # TTSEngine returns numpy float32 [-1, 1], VirtualOutput expects s16le bytes
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+
             # Step 4: Output to virtual microphone
-            self.virtual_output.play_audio(audio_data, self.tts.sample_rate)
+            self.virtual_output.play_audio(audio_bytes, self.tts.sample_rate)
             
             if self._on_synthesis:
                 self._on_synthesis()
@@ -328,7 +328,7 @@ class ReverseMode:
         if tts_voice:
             self.tts.set_voice(tts_voice)
         if tts_speed is not None:
-            self.tts.set_speed(tts_speed)
+            self.tts_speed = tts_speed  # Store for potential future use
         
         # Update translator prompt
         self.translator.prompt_template = (
@@ -340,13 +340,15 @@ class ReverseMode:
     @staticmethod
     def list_input_devices() -> list[dict]:
         """List available input devices (microphones)."""
-        return MicCapture.list_devices()
+        mic = MicCapture()
+        mic.backend = mic._detect_backend()
+        return mic.list_microphones()
     
     @staticmethod
     def list_tts_voices() -> list[str]:
         """List available TTS voices."""
         tts = TTSEngine()
-        return tts.list_voices()
+        return tts.get_available_voices()
     
     def __enter__(self):
         """Context manager entry."""

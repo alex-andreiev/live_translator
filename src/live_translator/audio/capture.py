@@ -115,13 +115,32 @@ class AudioCapture:
         bytes_per_chunk = self.chunk_size * 2  # 16-bit = 2 bytes per sample
 
         while self.running:
-            data = self.process.stdout.read(bytes_per_chunk)
-            if not data:
-                break
+            try:
+                if not self.process or not self.process.stdout:
+                    print("Audio capture process not available")
+                    break
 
-            # Convert to numpy float32 array normalized to [-1, 1]
-            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            self.audio_queue.put(audio)
+                data = self.process.stdout.read(bytes_per_chunk)
+                if not data:
+                    print("Audio capture: End of stream")
+                    break
+
+                # Convert to numpy float32 array normalized to [-1, 1]
+                audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+                try:
+                    self.audio_queue.put(audio, timeout=0.1)
+                except queue.Full:
+                    # Drop oldest chunk to prevent excessive buffering
+                    try:
+                        self.audio_queue.get_nowait()
+                        self.audio_queue.put_nowait(audio)
+                    except queue.Empty:
+                        pass
+            except Exception as e:
+                print(f"Audio capture error: {e}")
+                self.running = False
+                break
 
     def get_audio(self, timeout=1.0):
         """Get audio chunk from queue."""

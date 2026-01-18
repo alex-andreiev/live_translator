@@ -156,14 +156,11 @@ class MicCapture:
             audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
             try:
-                self.audio_queue.put_nowait(audio)
+                # Use blocking put with timeout to avoid race conditions
+                self.audio_queue.put(audio, timeout=0.1)
             except queue.Full:
-                # Drop oldest chunk to prevent excessive buffering
-                try:
-                    self.audio_queue.get_nowait()
-                    self.audio_queue.put_nowait(audio)
-                except queue.Empty:
-                    pass
+                # Queue is full even after timeout, drop this chunk
+                pass
 
     def get_audio(self, timeout=1.0):
         """Get audio chunk from queue."""

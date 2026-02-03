@@ -31,6 +31,7 @@ class SettingsDialog(Gtk.Window):
         self.parent_window = parent
         self.on_apply_callback = on_apply_callback
         self.settings = get_settings()
+        self._is_waiting_for_reload = False
 
         # Main container
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -82,14 +83,23 @@ class SettingsDialog(Gtk.Window):
         cancel_btn.connect("clicked", lambda b: self.close())
         button_box.append(cancel_btn)
 
-        apply_btn = Gtk.Button(label="Apply")
-        apply_btn.connect("clicked", self._on_apply)
-        button_box.append(apply_btn)
+        self.apply_btn = Gtk.Button(label="Apply")
+        self.apply_btn.connect("clicked", self._on_apply)
+        button_box.append(self.apply_btn)
 
-        save_btn = Gtk.Button(label="Save")
-        save_btn.add_css_class("suggested-action")
-        save_btn.connect("clicked", self._on_save)
-        button_box.append(save_btn)
+        self.save_btn = Gtk.Button(label="Save")
+        self.save_btn.add_css_class("suggested-action")
+        self.save_btn.connect("clicked", self._on_save)
+        button_box.append(self.save_btn)
+
+        self.reload_spinner = Gtk.Spinner()
+        self.reload_spinner.set_visible(False)
+        button_box.append(self.reload_spinner)
+
+        self.reload_status_label = Gtk.Label(label="Applying model changes...")
+        self.reload_status_label.add_css_class("dim-label")
+        self.reload_status_label.set_visible(False)
+        button_box.append(self.reload_status_label)
 
     def _wrap_in_scrolled_window(self, box):
         """Wrap a box in a scrolled window for proper scrolling."""
@@ -252,6 +262,21 @@ class SettingsDialog(Gtk.Window):
         lang_box.append(self.source_lang_entry)
         box.append(lang_box)
 
+        # Transcription-only mode
+        transcription_only_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        transcription_only_label = Gtk.Label(label="Transcription Only (No Translation):")
+        transcription_only_label.set_xalign(0)
+        transcription_only_label.set_hexpand(True)
+        transcription_only_box.append(transcription_only_label)
+
+        self.transcription_only_switch = Gtk.Switch()
+        self.transcription_only_switch.set_active(
+            self.settings.get("transcription", "transcription_only_mode", False)
+        )
+        self.transcription_only_switch.set_valign(Gtk.Align.CENTER)
+        transcription_only_box.append(self.transcription_only_switch)
+        box.append(transcription_only_box)
+
         # Speaker Diarization section
         diar_label = Gtk.Label(label="Speaker Diarization (Local)")
         diar_label.set_xalign(0)
@@ -406,7 +431,7 @@ class SettingsDialog(Gtk.Window):
         box.append(exp_lang_info)
 
         # Auto-detect info
-        autodetect_info = Gtk.Label(label="If enabled: auto-detects transcribed language.\nIf it matches target language, skips translation but continues logging.")
+        autodetect_info = Gtk.Label(label="If enabled: Whisper auto-detects spoken language.\nIf it matches target language, translation is skipped and logging continues.")
         autodetect_info.set_xalign(0)
         autodetect_info.add_css_class("dim-label")
         box.append(autodetect_info)
@@ -418,7 +443,7 @@ class SettingsDialog(Gtk.Window):
         box.append(opt_info)
 
         # Note
-        note_label = Gtk.Label(label="Note: Changes to transcription settings require restart.")
+        note_label = Gtk.Label(label="Changes apply immediately. Model/device changes may take a few seconds to reload.")
         note_label.set_xalign(0)
         note_label.add_css_class("dim-label")
         box.append(note_label)
@@ -1042,6 +1067,7 @@ class SettingsDialog(Gtk.Window):
         self.settings.set("transcription", "device", self.device_combo.get_active_text())
         self.settings.set("transcription", "compute_type", self.compute_combo.get_active_text())
         self.settings.set("transcription", "source_language", self.source_lang_entry.get_text())
+        self.settings.set("transcription", "transcription_only_mode", self.transcription_only_switch.get_active())
         self.settings.set("transcription", "enable_diarization", self.diarization_switch.get_active())
         num_speakers = int(self.num_speakers_spin.get_value())
         self.settings.set("transcription", "num_speakers", num_speakers if num_speakers > 0 else None)
@@ -1156,16 +1182,23 @@ class SettingsDialog(Gtk.Window):
 
     def _on_apply(self, button):
         """Apply settings without saving."""
+        if self._is_waiting_for_reload:
+            return
+
         errors = self._validate_settings()
         if errors:
             self._show_validation_errors(errors)
             return
         self._collect_settings()
         if self.on_apply_callback:
-            self.on_apply_callback(self.settings)
+            result = self.on_apply_callback(self.settings)
+            self._handle_apply_result(result)
 
     def _on_save(self, button):
         """Save settings and close."""
+        if self._is_waiting_for_reload:
+            return
+
         errors = self._validate_settings()
         if errors:
             self._show_validation_errors(errors)
@@ -1173,8 +1206,37 @@ class SettingsDialog(Gtk.Window):
         self._collect_settings()
         self.settings.save()
         if self.on_apply_callback:
-            self.on_apply_callback(self.settings)
+            result = self.on_apply_callback(self.settings)
+            self._handle_apply_result(result)
         self.close()
+
+    def _handle_apply_result(self, result):
+        """Handle app response after applying settings."""
+        if isinstance(result, dict) and result.get("transcriber_reload_in_progress"):
+            self._set_reload_waiting_state(True)
+            GLib.timeout_add(300, self._poll_reload_state)
+
+    def _set_reload_waiting_state(self, waiting):
+        """Show/hide reload indicator and block repeated Apply clicks."""
+        self._is_waiting_for_reload = waiting
+        self.apply_btn.set_sensitive(not waiting)
+        self.save_btn.set_sensitive(not waiting)
+        self.reload_spinner.set_visible(waiting)
+        self.reload_status_label.set_visible(waiting)
+        if waiting:
+            self.reload_spinner.start()
+        else:
+            self.reload_spinner.stop()
+
+    def _poll_reload_state(self):
+        """Poll app state and unlock controls when model reload is complete."""
+        app = getattr(self.parent_window, "app", None)
+        is_busy = bool(app and hasattr(app, "is_transcriber_reload_in_progress") and app.is_transcriber_reload_in_progress())
+        if is_busy:
+            return True
+
+        self._set_reload_waiting_state(False)
+        return False
 
     def _load_ollama_models(self):
         """Load Ollama models in background thread."""

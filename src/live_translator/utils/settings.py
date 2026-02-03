@@ -21,6 +21,7 @@ DEFAULT_SETTINGS = {
         "device": "cpu",
         "compute_type": "int8",
         "source_language": "en",
+        "transcription_only_mode": False,
         "enable_diarization": False,
         "num_speakers": 0,
         "min_audio_length": 0.5,

@@ -7,6 +7,7 @@ Real-time speech-to-text translation application for Linux. Captures system audi
 - **Real-time audio capture** from system audio (PipeWire/PulseAudio)
 - **Speech-to-text** using Faster-Whisper (local, offline, CPU/CUDA)
 - **Translation** via Ollama (local), OpenAI, or Anthropic
+- **Transcription-only mode** - writes recognized speech to logs without translation
 - **Speaker diarization** - detects and labels different speakers (local, no API key needed)
 - **Auto language detection** - skips translation when audio is in expected languages
 - **GTK4 overlay window** with scrollable translation history
@@ -99,6 +100,7 @@ Options:
   -t, --target-language  Target language name (default: Russian)
   -d, --device           Device for Whisper: cpu, cuda (default: cpu)
   --compute-type         Compute type: int8, float16, float32 (default: int8)
+  --transcription-only   Transcribe and log without translation
 ```
 
 ### Examples
@@ -118,7 +120,30 @@ Options:
 
 # Use GPU (requires CUDA and cuDNN)
 ./start.sh -d cuda
+
+# Log-only transcription mode (no translation)
+./start.sh --transcription-only
 ```
+
+### Analyze meeting/session logs
+
+If one meeting produced several session logs (for example, app restarts), use:
+
+```bash
+# Analyze logs created in a 3-hour window from a meeting start time
+live-translator-log-summary \
+  --session-start "2026-02-03 14:00" \
+  --window-minutes 180
+
+# Or analyze latest N logs
+live-translator-log-summary --latest 4
+```
+
+The report includes:
+- What was done
+- Important questions
+- Important client remarks
+- Open points and next steps
 
 ## Settings
 
@@ -137,6 +162,7 @@ Click the gear icon in the window header to open settings:
 - Source language
 - Speaker diarization (local, no API key needed)
 - Performance tuning (beam size, silence duration, etc.)
+- Transcription-only mode (disable translation and keep logging)
 - Auto language detection with expected languages list
 
 ### Translation
@@ -156,6 +182,7 @@ Click the gear icon in the window header to open settings:
 - Context-based summaries and learning help
 
 Settings are saved to `~/.config/live-translator/settings.json`
+Most settings and mode switches are applied immediately without restarting the app.
 
 ## Recommended Models
 

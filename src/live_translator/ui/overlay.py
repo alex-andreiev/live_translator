@@ -41,6 +41,13 @@ class CaptionOverlay(Gtk.ApplicationWindow):
         clear_btn.connect("clicked", lambda b: self.clear_history())
         header.pack_end(clear_btn)
 
+        # Transcription-only mode toggle
+        self.transcription_only_btn = Gtk.ToggleButton(label="Transcribe Only")
+        self.transcription_only_btn.set_tooltip_text("Toggle transcription-only mode (no translation)")
+        self.transcription_only_btn.set_active(self.settings.get("transcription", "transcription_only_mode", False))
+        self.transcription_only_btn.connect("toggled", self._on_transcription_only_toggled)
+        header.pack_start(self.transcription_only_btn)
+
         # AI Assistant toggle button
         self.ai_btn = Gtk.ToggleButton()
         self.ai_btn.set_icon_name("dialog-question-symbolic")
@@ -204,6 +211,18 @@ class CaptionOverlay(Gtk.ApplicationWindow):
         self.ai_frame.set_visible(visible)
         if visible:
             self.ai_entry.grab_focus()
+
+    def _on_transcription_only_toggled(self, button):
+        """Toggle transcription-only mode live."""
+        enabled = button.get_active()
+        if hasattr(self.app, "set_transcription_only_mode"):
+            self.app.set_transcription_only_mode(enabled, save_setting=True)
+
+    def set_transcription_only_mode(self, enabled):
+        """Sync mode toggle button state from app."""
+        if self.transcription_only_btn.get_active() == enabled:
+            return
+        self.transcription_only_btn.set_active(enabled)
 
     def _on_ai_submit(self, widget):
         """Handle AI Assistant submission."""
@@ -387,7 +406,8 @@ class CaptionOverlay(Gtk.ApplicationWindow):
         self.apply_appearance_settings()
         # Notify app about translation settings change
         if hasattr(self.app, 'on_settings_changed'):
-            self.app.on_settings_changed(settings)
+            return self.app.on_settings_changed(settings)
+        return None
 
     def _scroll_to_end(self, scrolled_window, text_buffer):
         """Scroll to the end of the text."""

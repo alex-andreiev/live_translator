@@ -45,6 +45,8 @@ class Transcriber:
         print(f"Loading Whisper model '{model_size}' on {device} ({compute_type})...")
         self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
         print("Model loaded.")
+        self.model_size = model_size
+        self.compute_type = compute_type
 
         self.audio_buffer = []
         self._buffer_lock = threading.RLock()  # Reentrant lock for thread safety
@@ -193,7 +195,10 @@ class Transcriber:
                 speech_pad_ms=self.speech_pad_ms
             ),
             word_timestamps=self.enable_diarization,  # Need timestamps for diarization
+            condition_on_previous_text=False,  # Helps reduce repetition/hallucinated loops
             temperature=0.0,  # More deterministic, faster
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
             no_speech_threshold=self.no_speech_threshold
         )
 
@@ -215,7 +220,37 @@ class Transcriber:
             text_parts.append(segment.text.strip())
 
         text = " ".join(text_parts).strip()
-        return text if text else None
+        if not text:
+            return None
+        if self._looks_like_repetition_hallucination(text):
+            return None
+        return text
+
+    def _looks_like_repetition_hallucination(self, text):
+        """
+        Detect obvious repetition loops like:
+        'и все еще и все еще ...' to avoid logging/model artifacts.
+        """
+        words = [w for w in text.lower().split() if w]
+        if len(words) < 12:
+            return False
+
+        # Too few unique words in long output is usually a hallucination loop.
+        unique_ratio = len(set(words)) / len(words)
+        if len(words) >= 24 and unique_ratio < 0.22:
+            return True
+
+        # Detect long consecutive single-word repeats.
+        run = 1
+        for i in range(1, len(words)):
+            if words[i] == words[i - 1]:
+                run += 1
+                if run >= 6:
+                    return True
+            else:
+                run = 1
+
+        return False
 
     def _transcribe_with_diarization(self, audio, segments):
         """Transcribe with local speaker diarization using resemblyzer."""

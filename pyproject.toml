@@ -46,6 +46,7 @@ all = [
 
 [project.scripts]
 live-translator = "live_translator.app:main"
+live-translator-log-summary = "live_translator.tools.log_analyzer_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/live-translator/live-translator"

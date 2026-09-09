@@ -1,5 +1,5 @@
 """
-Translation module using Ollama or other providers
+Translation through the configured provider adapter (see live_translator.ai.providers).
 """
 from live_translator.ai import APIClient
 
@@ -10,8 +10,9 @@ class Translator:
         Initialize translator.
 
         Args:
-            provider: Translation provider (ollama, openai, anthropic)
-            model: Model name
+            provider: Provider key from live_translator.ai.providers.PROVIDERS
+                ("none" transcribes without translating)
+            model: Model ID for that provider
             target_language: Target language for translation
             prompt: Custom prompt template (use {text} and {target_language} as placeholders)
         """
@@ -25,11 +26,17 @@ class Translator:
         # Use shared API client with timeout
         self._client = APIClient(provider=provider, model=model, timeout=30)
 
+    @property
+    def last_error(self):
+        """Message from the most recent failed request, or None."""
+        return self._client.last_error
+
     def set_settings(self, provider=None, model=None, target_language=None, prompt=None):
-        """Update translator settings."""
-        if provider:
+        """Update translator settings; None leaves a field unchanged."""
+        # Compare against None so "none" and a cleared model still apply.
+        if provider is not None:
             self.provider = provider
-        if model:
+        if model is not None:
             self.model = model
         if target_language:
             self.target_language = target_language
@@ -48,7 +55,7 @@ class Translator:
         Returns:
             Translated text or None on error
         """
-        if not text or not text.strip():
+        if not text or not text.strip() or self.provider == "none":
             return None
 
         prompt = self.prompt_template.format(

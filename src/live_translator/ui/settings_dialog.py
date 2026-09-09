@@ -5,24 +5,12 @@ import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, Gdk, GLib
 import threading
+from copy import deepcopy
+from live_translator.ui.provider_settings import ProviderSettings
+from live_translator.processing.whisper_models import WHISPER_MODELS, model_description
 
 from live_translator.utils import get_settings
 
-
-def get_ollama_models():
-    """Fetch list of available Ollama models."""
-    try:
-        import ollama
-        response = ollama.list()
-        # Handle both old dict format and new object format
-        if hasattr(response, 'models'):
-            return [m.model for m in response.models]
-        elif isinstance(response, dict):
-            return [m.get('name') or m.get('model') for m in response.get('models', [])]
-        return []
-    except Exception as e:
-        print(f"Error fetching Ollama models: {e}")
-        return []
 
 class SettingsDialog(Gtk.Window):
     def __init__(self, parent, on_apply_callback=None):
@@ -31,6 +19,9 @@ class SettingsDialog(Gtk.Window):
         self.parent_window = parent
         self.on_apply_callback = on_apply_callback
         self.settings = get_settings()
+        self.provider_profiles = deepcopy(self.settings.get_all().get("providers", {}))
+        self._recommend_labels = {}
+        self._recommend_buttons = {}
 
         # Main container
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -72,6 +63,10 @@ class SettingsDialog(Gtk.Window):
         # Reverse Translation tab
         reverse_page = self._create_reverse_translation_tab()
         notebook.append_page(reverse_page, Gtk.Label(label="Reverse"))
+
+        # System check tab
+        notebook.append_page(self._create_system_check_tab(),
+                             Gtk.Label(label="System Check"))
 
         # Buttons
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -194,6 +189,8 @@ class SettingsDialog(Gtk.Window):
         box.set_margin_start(15)
         box.set_margin_end(15)
 
+        box.append(self._build_recommend_row("transcription"))
+
         # Whisper model
         model_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         model_label = Gtk.Label(label="Whisper Model:")
@@ -202,12 +199,16 @@ class SettingsDialog(Gtk.Window):
         model_box.append(model_label)
 
         self.whisper_model_combo = Gtk.ComboBoxText()
-        for model in ["tiny", "base", "small", "medium", "large-v2", "large-v3"]:
-            self.whisper_model_combo.append_text(model)
         current_model = self.settings.get("transcription", "whisper_model", "base")
-        self.whisper_model_combo.set_active(["tiny", "base", "small", "medium", "large-v2", "large-v3"].index(current_model))
+        for model in dict.fromkeys([*WHISPER_MODELS, current_model]):
+            params = WHISPER_MODELS.get(model)
+            self.whisper_model_combo.append(model, f"{model} — {params[0]}M parameters" if params else model)
+        self.whisper_model_combo.set_active_id(current_model)
         model_box.append(self.whisper_model_combo)
         box.append(model_box)
+        self.whisper_details = Gtk.Label(xalign=0, wrap=True)
+        box.append(self.whisper_details)
+        self.whisper_model_combo.connect("changed", self._update_whisper_details)
 
         # Device
         device_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -223,6 +224,8 @@ class SettingsDialog(Gtk.Window):
         self.device_combo.set_active(0 if current_device == "cpu" else 1)
         device_box.append(self.device_combo)
         box.append(device_box)
+        self.device_combo.connect("changed", self._update_whisper_details)
+        self._update_whisper_details()
 
         # Compute type
         compute_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -418,7 +421,10 @@ class SettingsDialog(Gtk.Window):
         box.append(opt_info)
 
         # Note
-        note_label = Gtk.Label(label="Note: Changes to transcription settings require restart.")
+        note_label = Gtk.Label(label="Transcription changes apply on Apply/Save: the model "
+                                     "reloads in the background and the status bar reports "
+                                     "when it is ready. A model's first use downloads it.",
+                               wrap=True)
         note_label.set_xalign(0)
         note_label.add_css_class("dim-label")
         box.append(note_label)
@@ -477,28 +483,14 @@ class SettingsDialog(Gtk.Window):
         box.set_margin_start(15)
         box.set_margin_end(15)
 
-        # Model selection
-        model_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        model_label = Gtk.Label(label="Ollama Model:")
-        model_label.set_xalign(0)
-        model_label.set_hexpand(True)
-        model_box.append(model_label)
+        box.append(self._build_recommend_row("translation"))
 
-        self.model_combo = Gtk.ComboBoxText()
-        self.model_combo.set_size_request(250, -1)
-        model_box.append(self.model_combo)
-
-        refresh_btn = Gtk.Button()
-        refresh_btn.set_icon_name("view-refresh-symbolic")
-        refresh_btn.set_tooltip_text("Refresh model list")
-        refresh_btn.connect("clicked", self._on_refresh_models)
-        model_box.append(refresh_btn)
-
-        box.append(model_box)
-
-        # Load models in background
-        self.ollama_models = []
-        self._load_ollama_models()
+        self.translation_provider = ProviderSettings(self.settings, "translation", self.provider_profiles)
+        box.append(self.translation_provider)
+        key_info = Gtk.Label(label="Saved API keys are stored in your private settings file. Leave blank to use environment variables.", xalign=0, wrap=True)
+        box.append(key_info)
+        box.append(self._build_lmstudio_help())
+        box.append(self._build_lmstudio_manager())
 
         # Target language
         target_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -651,21 +643,10 @@ class SettingsDialog(Gtk.Window):
         same_model_box.append(self.ai_use_trans_model_switch)
         box.append(same_model_box)
 
-        # AI Model selection (shown when not using translation model)
-        self.ai_model_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        ai_model_label = Gtk.Label(label="AI Model:")
-        ai_model_label.set_xalign(0)
-        ai_model_label.set_hexpand(True)
-        self.ai_model_box.append(ai_model_label)
-
-        self.ai_model_combo = Gtk.ComboBoxText()
-        self.ai_model_combo.set_size_request(250, -1)
-        self.ai_model_box.append(self.ai_model_combo)
+        self.ai_model_box = ProviderSettings(self.settings, "ai_assistant", self.provider_profiles, connections=False)
+        self.ai_model_box.before_request = self.translation_provider.snapshot
         self.ai_model_box.set_visible(not self.ai_use_trans_model_switch.get_active())
         box.append(self.ai_model_box)
-
-        # Load AI models in background
-        self._load_ai_ollama_models()
 
         # Context entries
         context_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -844,8 +825,8 @@ class SettingsDialog(Gtk.Window):
         input_dev_box.append(input_dev_label)
 
         self.reverse_input_device_combo = Gtk.ComboBoxText()
-        self.reverse_input_device_combo.append_text("Default")
-        self.reverse_input_device_combo.set_active(0)
+        self.reverse_input_device_combo.append("", "Default")
+        self.reverse_input_device_combo.set_active_id("")
         input_dev_box.append(self.reverse_input_device_combo)
         box.append(input_dev_box)
 
@@ -936,8 +917,8 @@ class SettingsDialog(Gtk.Window):
         """Load input devices in background."""
         def fetch_devices():
             try:
-                from mic_capture import MicCapture
-                devices = MicCapture.list_devices()
+                from live_translator.audio import list_available_microphones
+                devices = list_available_microphones()
                 GLib.idle_add(self._populate_input_devices, devices)
             except Exception as e:
                 print(f"Error loading input devices: {e}")
@@ -945,53 +926,31 @@ class SettingsDialog(Gtk.Window):
         threading.Thread(target=fetch_devices, daemon=True).start()
 
     def _populate_input_devices(self, devices):
-        """Populate input device combo."""
+        """Populate input device combo, keyed by the device id used for capture."""
         self.reverse_input_device_combo.remove_all()
-        self.reverse_input_device_combo.append_text("Default")
+        self.reverse_input_device_combo.append("", "Default")
 
         current_device = self.settings.get("reverse_translation", "input_device", "")
-        active_index = 0
-
+        known = {""}
         for i, dev in enumerate(devices):
-            name = dev.get('name', dev.get('description', f'Device {i}'))
-            self.reverse_input_device_combo.append_text(name)
-            if name == current_device:
-                active_index = i + 1  # +1 because of "Default" at index 0
+            device_id = dev.get('id') or dev.get('name') or f'device-{i}'
+            label = dev.get('name') or dev.get('description') or device_id
+            if device_id in known:
+                continue
+            known.add(device_id)
+            self.reverse_input_device_combo.append(device_id, label)
 
-        self.reverse_input_device_combo.set_active(active_index)
+        # Keep a saved device selectable even when it is currently unplugged.
+        if current_device and current_device not in known:
+            self.reverse_input_device_combo.append(current_device, f"{current_device} (not detected)")
+        self.reverse_input_device_combo.set_active_id(current_device or "")
 
     def _on_refresh_input_devices(self, button):
         """Refresh input device list."""
         self.reverse_input_device_combo.remove_all()
-        self.reverse_input_device_combo.append_text("Loading...")
-        self.reverse_input_device_combo.set_active(0)
+        self.reverse_input_device_combo.append("", "Loading...")
+        self.reverse_input_device_combo.set_active_id("")
         self._load_input_devices()
-
-    def _load_ai_ollama_models(self):
-        """Load Ollama models for AI assistant."""
-        def fetch_models():
-            models = get_ollama_models()
-            GLib.idle_add(self._populate_ai_model_combo, models)
-
-        threading.Thread(target=fetch_models, daemon=True).start()
-
-    def _populate_ai_model_combo(self, models):
-        """Populate AI model combo box with fetched models."""
-        self.ai_model_combo.remove_all()
-
-        current_model = self.settings.get("ai_assistant", "model", "mistral:7b")
-        active_index = 0
-
-        for i, model in enumerate(models):
-            self.ai_model_combo.append_text(model)
-            if model == current_model:
-                active_index = i
-
-        if models:
-            self.ai_model_combo.set_active(active_index)
-        else:
-            self.ai_model_combo.append_text("No models found")
-            self.ai_model_combo.set_active(0)
 
     def _on_browse_log_path(self, button):
         """Open folder chooser for log path."""
@@ -1038,7 +997,7 @@ class SettingsDialog(Gtk.Window):
         self.settings.set("appearance", "translated_font_size", int(self.trans_size_spin.get_value()))
 
         # Transcription
-        self.settings.set("transcription", "whisper_model", self.whisper_model_combo.get_active_text())
+        self.settings.set("transcription", "whisper_model", self.whisper_model_combo.get_active_id())
         self.settings.set("transcription", "device", self.device_combo.get_active_text())
         self.settings.set("transcription", "compute_type", self.compute_combo.get_active_text())
         self.settings.set("transcription", "source_language", self.source_lang_entry.get_text())
@@ -1068,10 +1027,10 @@ class SettingsDialog(Gtk.Window):
         self.settings.set("speakers", "unknown_speaker_color", self._rgba_to_css(self.unknown_speaker_color_btn.get_rgba()))
 
         # Translation
-        self.settings.set("translation", "provider", "ollama")
-        selected_model = self.model_combo.get_active_text()
-        if selected_model:
-            self.settings.set("translation", "model", selected_model)
+        self.translation_provider.collect(self.settings, "translation")
+        self.ai_model_box.collect(self.settings, "ai_assistant")
+        for provider, options in self.provider_profiles.items():
+            self.settings.set("providers", provider, deepcopy(options))
         self.settings.set("translation", "target_language", self.target_lang_entry.get_text())
 
         start_iter = self.prompt_buffer.get_start_iter()
@@ -1087,9 +1046,6 @@ class SettingsDialog(Gtk.Window):
         # AI Assistant
         self.settings.set("ai_assistant", "enabled", self.ai_enabled_switch.get_active())
         self.settings.set("ai_assistant", "use_translation_model", self.ai_use_trans_model_switch.get_active())
-        selected_ai_model = self.ai_model_combo.get_active_text()
-        if selected_ai_model and selected_ai_model != "No models found":
-            self.settings.set("ai_assistant", "model", selected_ai_model)
         self.settings.set("ai_assistant", "context_entries", int(self.ai_context_spin.get_value()))
         self.settings.set("ai_assistant", "auto_detect_questions", self.ai_auto_detect_switch.get_active())
         self.settings.set("ai_assistant", "show_tips_on_failure", self.ai_tips_switch.get_active())
@@ -1103,12 +1059,9 @@ class SettingsDialog(Gtk.Window):
         self.settings.set("reverse_translation", "source_language", self.reverse_source_lang_entry.get_text())
         self.settings.set("reverse_translation", "target_language", self.reverse_target_lang_entry.get_text())
         
-        # Input device (skip "Default" which means empty string)
-        selected_device = self.reverse_input_device_combo.get_active_text()
-        if selected_device and selected_device not in ["Default", "Loading..."]:
-            self.settings.set("reverse_translation", "input_device", selected_device)
-        else:
-            self.settings.set("reverse_translation", "input_device", "")
+        # Input device id; "" is the Default entry and means the system default.
+        self.settings.set("reverse_translation", "input_device",
+                          self.reverse_input_device_combo.get_active_id() or "")
         
         self.settings.set("reverse_translation", "tts_engine", self.reverse_tts_engine_combo.get_active_text())
         self.settings.set("reverse_translation", "tts_voice", self.reverse_tts_voice_entry.get_text())
@@ -1117,7 +1070,9 @@ class SettingsDialog(Gtk.Window):
 
     def _validate_settings(self):
         """Validate all settings before applying."""
-        errors = []
+        errors = self.translation_provider.validate()
+        if self.ai_enabled_switch.get_active() and not self.ai_use_trans_model_switch.get_active():
+            errors.extend(self.ai_model_box.validate())
 
         # Validate target language
         target_lang = self.target_lang_entry.get_text().strip()
@@ -1142,15 +1097,19 @@ class SettingsDialog(Gtk.Window):
         return errors
 
     def _show_validation_errors(self, errors):
-        """Show validation error dialog."""
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK,
-            text="Validation Errors"
-        )
-        dialog.format_secondary_text("\n".join(errors))
+        """Show validation errors. Gtk.AlertDialog replaces GTK3's MessageDialog API."""
+        detail = "\n".join(f"\u2022 {error}" for error in errors)
+        if hasattr(Gtk, "AlertDialog"):
+            dialog = Gtk.AlertDialog(modal=True, message="Validation Errors", detail=detail)
+            dialog.set_buttons(["OK"])
+            dialog.show(self)
+            return
+        # GTK < 4.10: MessageDialog is still present but has no format_secondary_text.
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.ERROR,
+                                   buttons=Gtk.ButtonsType.OK,
+                                   text="Validation Errors",
+                                   secondary_text=detail)
         dialog.connect("response", lambda d, r: d.destroy())
         dialog.present()
 
@@ -1176,37 +1135,225 @@ class SettingsDialog(Gtk.Window):
             self.on_apply_callback(self.settings)
         self.close()
 
-    def _load_ollama_models(self):
-        """Load Ollama models in background thread."""
-        def fetch_models():
-            models = get_ollama_models()
-            GLib.idle_add(self._populate_model_combo, models)
+    def _create_system_check_tab(self):
+        """Verify dependencies, hardware and whether the settings suit this machine."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for side in ("top", "start", "end"):
+            getattr(box, f"set_margin_{side}")(15)
 
-        threading.Thread(target=fetch_models, daemon=True).start()
+        box.append(Gtk.Label(
+            label="Checks that the system is configured and the current settings can "
+                  "actually run on this hardware. Run it after changing settings, or when "
+                  "something does not work.", xalign=0, wrap=True))
 
-    def _populate_model_combo(self, models):
-        """Populate model combo box with fetched models."""
-        self.ollama_models = models
-        self.model_combo.remove_all()
+        controls = Gtk.Box(spacing=10)
+        self.check_button = Gtk.Button(label="Run system check")
+        self.check_button.connect("clicked", self._on_run_checks)
+        controls.append(self.check_button)
+        self.check_summary = Gtk.Label(xalign=0, wrap=True)
+        controls.append(self.check_summary)
+        box.append(controls)
 
-        current_model = self.settings.get("translation", "model", "mistral:7b")
-        active_index = 0
+        self.check_results = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.check_results.add_css_class("monospace")
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        scroller.set_child(self.check_results)
+        box.append(scroller)
 
-        for i, model in enumerate(models):
-            self.model_combo.append_text(model)
-            if model == current_model:
-                active_index = i
+        box.append(Gtk.Label(
+            label="The same report is available without the UI: ./start.sh --check "
+                  "(exit status 1 if anything would stop the app working).",
+            xalign=0, wrap=True))
+        return self._wrap_in_scrolled_window(box)
 
-        if models:
-            self.model_combo.set_active(active_index)
+    def _on_run_checks(self, button):
+        """Checks shell out and query providers, so run them off the GTK thread."""
+        self.check_button.set_sensitive(False)
+        self.check_summary.set_text("Running…")
+        self.check_results.set_text("")
+        # Check the settings as currently edited, not only what was last saved.
+        self._collect_settings()
+        settings = self.settings
+
+        def worker():
+            from live_translator.utils.diagnostics import run_checks, summarize, FAIL, WARN
+            try:
+                results = run_checks(settings)
+                report = "\n".join(r.line() for r in results)
+                summary = summarize(results)
+                worst = (FAIL if any(r.status == FAIL for r in results)
+                         else WARN if any(r.status == WARN for r in results) else "ok")
+            except Exception as exc:
+                report, summary, worst = "", f"Could not run the checks: {exc}", FAIL
+            GLib.idle_add(finish, report, summary, worst)
+
+        def finish(report, summary, worst):
+            self.check_button.set_sensitive(True)
+            self.check_results.set_text(report)
+            self.check_summary.set_text(summary)
+            for css in ("error", "warning", "success"):
+                self.check_summary.remove_css_class(css)
+            self.check_summary.add_css_class(
+                {"fail": "error", "warn": "warning"}.get(worst, "success"))
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_recommend_row(self, target):
+        """Button that plans settings for the detected hardware, plus its reasoning."""
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        controls = Gtk.Box(spacing=10)
+        button = Gtk.Button(label="Recommend for this machine")
+        button.set_tooltip_text("Detect CPU, RAM and GPU, then choose settings that fit "
+                                "Whisper and the translation model on this hardware.")
+        button.connect("clicked", self._on_recommend, target)
+        controls.append(button)
+        row.append(controls)
+        detail = Gtk.Label(xalign=0, wrap=True)
+        detail.add_css_class("dim-label")
+        row.append(detail)
+        self._recommend_labels[target] = detail
+        self._recommend_buttons[target] = button
+        return row
+
+    def _build_lmstudio_help(self):
+        """Collapsed LM Studio command reference and suggested translation models."""
+        from live_translator.ai.providers.lmstudio_catalog import (
+            describe_commands, describe_catalog, RECOMMENDED_CONTEXT)
+        expander = Gtk.Expander(label="LM Studio setup: commands and suggested models")
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content.set_margin_top(8)
+        content.set_margin_start(12)
+
+        content.append(Gtk.Label(label="Terminal commands", xalign=0))
+        commands = Gtk.Label(label=describe_commands(context_length=RECOMMENDED_CONTEXT),
+                             xalign=0, wrap=True, selectable=True)
+        commands.add_css_class("monospace")
+        content.append(commands)
+
+        content.append(Gtk.Label(label="Suggested translation models", xalign=0))
+        self.lmstudio_catalog_label = Gtk.Label(label=describe_catalog(), xalign=0,
+                                                wrap=True, selectable=True)
+        content.append(self.lmstudio_catalog_label)
+        content.append(Gtk.Label(
+            label="Search terms for `lms get`, not exact ids — LM Studio picks a "
+                  "quantization for your hardware. Sizes are approximate for a 4-bit "
+                  "build; run the --estimate-only command above for the real figure. "
+                  "Click \u201cRecommend for this machine\u201d to mark which ones fit.",
+            xalign=0, wrap=True))
+        expander.set_child(content)
+        return expander
+
+    def _build_lmstudio_manager(self):
+        """Model browser: download, load, unload and pick a model for translation."""
+        from live_translator.ui.lmstudio_manager import LMStudioManager
+        expander = Gtk.Expander(label="LM Studio models: download, load and run")
+        expander.set_expanded(True)
+        self.lmstudio_manager = LMStudioManager(self._translation_budget_mb,
+                                                self._lmstudio_connection)
+        self.lmstudio_manager.set_margin_top(8)
+        self.lmstudio_manager.set_margin_start(12)
+        self.lmstudio_manager.on_model_chosen = self._use_lmstudio_model
+        expander.set_child(self.lmstudio_manager)
+        if self.settings.get("translation", "provider", "ollama") == "lmstudio":
+            self.lmstudio_manager.autoload()
+        return expander
+
+    def _lmstudio_connection(self):
+        """Current LM Studio connection, including edits not yet applied."""
+        self.translation_provider.snapshot()
+        return self.provider_profiles.get("lmstudio", {})
+
+    def _use_lmstudio_model(self, name):
+        self.translation_provider.apply_choice("lmstudio", name)
+
+    def _translation_budget_mb(self):
+        """VRAM left for a translation model once the selected Whisper model loads.
+
+        Read from the widgets rather than saved settings, so the verdicts track
+        edits made in this dialog before they are applied.
+        """
+        try:
+            from live_translator.utils.hardware import detect_hardware, SAFETY_MARGIN_MB
+            from live_translator.processing.whisper_models import estimated_vram_mb
+            hardware = self._hardware = getattr(self, "_hardware", None) or detect_hardware()
+            total = hardware.get("vram_total_mb")
+            if not total or not hardware.get("cuda_devices"):
+                return None
+            if self.device_combo.get_active_text() != "cuda":
+                return total - SAFETY_MARGIN_MB  # Whisper is on the CPU.
+            whisper = estimated_vram_mb(self.whisper_model_combo.get_active_id(),
+                                        self.compute_combo.get_active_text()) or 0
+            return max(total - SAFETY_MARGIN_MB - whisper, 0)
+        except Exception:
+            return None
+
+    def _on_recommend(self, button, target):
+        """Plan settings off the GTK thread: detection shells out and queries providers."""
+        for widget in self._recommend_buttons.values():
+            widget.set_sensitive(False)
+        self._recommend_labels[target].set_text("Detecting hardware and installed models\u2026")
+        profiles = deepcopy(self.provider_profiles)
+
+        def worker():
+            try:
+                from live_translator.utils.hardware import detect_hardware, recommend_setup
+                plan = recommend_setup(detect_hardware(), profiles)
+                error = None
+            except Exception:
+                plan, error = None, "Could not detect this machine's capabilities."
+            GLib.idle_add(finish, plan, error)
+
+        def finish(plan, error):
+            for widget in self._recommend_buttons.values():
+                widget.set_sensitive(True)
+            if error or not plan:
+                self._recommend_labels[target].set_text(error or "No recommendation available.")
+                return False
+            self._apply_recommendation(plan, target)
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_recommendation(self, plan, target):
+        """Write the plan into the widgets; Apply/Save still decides persistence."""
+        applied = []
+        if target == "transcription":
+            transcription = plan["transcription"]
+            self.whisper_model_combo.set_active_id(transcription["whisper_model"])
+            self.device_combo.set_active(0 if transcription["device"] == "cpu" else 1)
+            compute = transcription["compute_type"]
+            for index, name in enumerate(["int8", "float16", "float32"]):
+                if name == compute:
+                    self.compute_combo.set_active(index)
+            self.diarization_switch.set_active(transcription["enable_diarization"])
+            self.beam_spin.set_value(transcription["beam_size"])
+            applied.append(f"{transcription['whisper_model']} + {compute} on "
+                           f"{transcription['device']}, beam {transcription['beam_size']}, "
+                           f"diarization {'on' if transcription['enable_diarization'] else 'off'}")
         else:
-            # No models found, add placeholder
-            self.model_combo.append_text("No models found")
-            self.model_combo.set_active(0)
+            translation = plan["translation"]
+            if translation:
+                self.translation_provider.apply_choice(translation["provider"],
+                                                       translation["model"])
+                applied.append(f"{translation['model']} on {translation['provider']}")
+            else:
+                applied.append("no local model fits — see the suggestions below")
+            if getattr(self, "lmstudio_catalog_label", None) is not None and plan["suggestions"]:
+                from live_translator.ai.providers.lmstudio_catalog import describe_catalog
+                budget = max((entry[2] for entry in plan["suggestions"]), default=0) * 1024
+                self.lmstudio_catalog_label.set_text(describe_catalog(budget))
 
-    def _on_refresh_models(self, button):
-        """Refresh model list."""
-        self.model_combo.remove_all()
-        self.model_combo.append_text("Loading...")
-        self.model_combo.set_active(0)
-        self._load_ollama_models()
+        text = "\n".join([plan["hardware"], "", "Applied: " + "; ".join(applied), ""]
+                         + [f"\u2022 {reason}" for reason in plan["reasons"]])
+        if target == "translation" and plan["suggestions"]:
+            text += ("\n\u2022 Suggested downloads: "
+                     + ", ".join(f"{e[0]} (~{e[2]:.1f} GB)" for e in plan["suggestions"][:3]))
+        text += "\n\nNothing is saved until you press Apply or Save."
+        self._recommend_labels[target].set_text(text)
+
+    def _update_whisper_details(self, *_):
+        self.whisper_details.set_text(model_description(
+            self.whisper_model_combo.get_active_id(), self.device_combo.get_active_text()))

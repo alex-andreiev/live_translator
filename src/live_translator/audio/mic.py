@@ -1,6 +1,7 @@
 """
 Microphone capture module - captures audio from microphone input
 """
+import json
 import subprocess
 import threading
 import queue
@@ -56,48 +57,55 @@ class MicCapture:
         return None  # Use system default
 
     def list_microphones(self):
-        """List available microphone devices."""
+        """List available microphone devices as {'id', 'name', 'full'} dicts."""
+        if self.backend == 'pipewire' or shutil.which('pw-dump'):
+            microphones = self._list_pipewire_sources()
+            if microphones:
+                return microphones
+        return self._list_pulseaudio_sources()
+
+    @staticmethod
+    def _list_pipewire_sources():
+        """List PipeWire capture nodes via pw-dump's JSON node graph."""
+        # pw-record has no source listing flag, so read the graph directly.
+        if not shutil.which('pw-dump'):
+            return []
+        try:
+            result = subprocess.run(['pw-dump'], capture_output=True, text=True, timeout=10)
+            objects = json.loads(result.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return []
+
         microphones = []
-        
-        if self.backend == 'pipewire' or shutil.which('pw-record'):
-            try:
-                result = subprocess.run(
-                    ['pw-record', '--list-targets'],
-                    capture_output=True, text=True
-                )
-                for line in result.stdout.split('\n'):
-                    if line.strip() and ':' in line:
-                        # Format: "id: name (description)"
-                        parts = line.split(':', 1)
-                        if len(parts) == 2:
-                            mic_id = parts[0].strip()
-                            mic_name = parts[1].strip()
-                            microphones.append({
-                                'id': mic_id,
-                                'name': mic_name,
-                                'full': line.strip()
-                            })
-            except Exception as e:
-                print(f"Error listing PipeWire sources: {e}")
-        
-        elif shutil.which('pactl'):
-            try:
-                result = subprocess.run(
-                    ['pactl', 'list', 'sources', 'short'],
-                    capture_output=True, text=True
-                )
-                for line in result.stdout.split('\n'):
-                    if line.strip():
-                        parts = line.split('\t')
-                        if len(parts) >= 2:
-                            microphones.append({
-                                'id': parts[0],
-                                'name': parts[1],
-                                'full': line.strip()
-                            })
-            except Exception as e:
-                print(f"Error listing PulseAudio sources: {e}")
-        
+        for entry in objects:
+            if not isinstance(entry, dict):
+                continue
+            props = ((entry.get('info') or {}).get('props') or {})
+            if props.get('media.class') not in ('Audio/Source', 'Audio/Duplex'):
+                continue
+            name = props.get('node.name')
+            if not name:
+                continue
+            description = props.get('node.description') or props.get('node.nick') or name
+            microphones.append({'id': name, 'name': description, 'full': name})
+        return microphones
+
+    @staticmethod
+    def _list_pulseaudio_sources():
+        """List PulseAudio sources, skipping monitors of output sinks."""
+        if not shutil.which('pactl'):
+            return []
+        try:
+            result = subprocess.run(['pactl', 'list', 'sources', 'short'],
+                                    capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+
+        microphones = []
+        for line in result.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2 and not parts[1].endswith('.monitor'):
+                microphones.append({'id': parts[1], 'name': parts[1], 'full': line.strip()})
         return microphones
 
     def start(self):

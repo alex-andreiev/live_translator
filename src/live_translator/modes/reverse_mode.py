@@ -3,7 +3,7 @@ Reverse Translation Mode - Speech-to-Speech Translation.
 Captures microphone audio, transcribes, translates, synthesizes speech,
 and outputs to virtual microphone for video call apps.
 
-Pipeline: Microphone → Whisper STT → Ollama Translate → Piper TTS → Virtual Mic
+Pipeline: Microphone → Whisper STT → provider translation → Piper TTS → Virtual Mic
 """
 
 import threading
@@ -45,7 +45,7 @@ class ReverseTranslationMode:
             whisper_model: Whisper model size
             whisper_device: cpu or cuda
             whisper_compute_type: int8, float16, float32
-            translator_provider: Translation provider (ollama)
+            translator_provider: Provider key (see live_translator.ai.providers.PROVIDERS)
             translator_model: Translation model name
             source_language: Language you speak
             target_language: Language to translate to
@@ -369,16 +369,16 @@ if __name__ == "__main__":
     
     # List available devices
     print("Available input devices:")
-    for dev in ReverseMode.list_input_devices():
+    for dev in ReverseTranslationMode.list_input_devices():
         print(f"  - {dev['name']}")
     
     print("\nAvailable TTS voices:")
-    for voice in ReverseMode.list_tts_voices()[:5]:  # Show first 5
+    for voice in ReverseTranslationMode.list_tts_voices()[:5]:  # Show first 5
         print(f"  - {voice}")
     
     # Create instance
     print("\nInitializing...")
-    reverse = ReverseMode(
+    reverse = ReverseTranslationMode(
         whisper_model="tiny",  # Use tiny for testing
         whisper_device="cpu",
         source_language="Russian",

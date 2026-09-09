@@ -2,10 +2,13 @@
 Settings management for Live Translator
 """
 import json
+from copy import deepcopy
+import tempfile
 import os
 from pathlib import Path
 
 DEFAULT_SETTINGS = {
+    "providers": {},
     "appearance": {
         "background_color": "rgba(30, 30, 30, 0.95)",
         "original_text_color": "#ffffff",
@@ -83,7 +86,7 @@ class Settings:
     def __init__(self):
         self.config_dir = Path.home() / ".config" / "live-translator"
         self.config_file = self.config_dir / "settings.json"
-        self.settings = DEFAULT_SETTINGS.copy()
+        self.settings = deepcopy(DEFAULT_SETTINGS)
         self.load()
 
     def load(self):
@@ -109,8 +112,14 @@ class Settings:
         """Save settings to file."""
         try:
             self.config_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.config_file, 'w') as f:
-                json.dump(self.settings, f, indent=2)
+            fd, temporary = tempfile.mkstemp(dir=self.config_dir, prefix=".settings-")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self.settings, f, indent=2)
+                os.replace(temporary, self.config_file)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
         except Exception as e:
             print(f"Error saving settings: {e}")
 
@@ -127,7 +136,7 @@ class Settings:
 
     def get_all(self):
         """Get all settings."""
-        return self.settings.copy()
+        return deepcopy(self.settings)
 
 
 # Global settings instance

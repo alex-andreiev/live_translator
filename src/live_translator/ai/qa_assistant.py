@@ -71,7 +71,7 @@ class QAAssistant:
         Initialize QA Assistant.
 
         Args:
-            provider: AI provider (ollama, openai, anthropic)
+            provider: Provider key (see live_translator.ai.providers.PROVIDERS)
             model: Model name
             source_language: Original text language
             target_language: User's preferred language for responses
@@ -219,8 +219,9 @@ class QAAssistant:
             response = self._generate_response(prompt)
 
             if not response:
-                # Generate tips as fallback
-                return self._generate_tips_response(context, question)
+                error = self._client.last_error or "AI provider is disabled or returned no response."
+                return {"success": False, "original_response": error,
+                        "translated_response": error, "is_tips": False}
 
             # Check if response indicates no answer found
             no_answer_indicators = [

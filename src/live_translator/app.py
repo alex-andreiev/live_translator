@@ -3,6 +3,7 @@
 Live Translator - Real-time speech-to-text translation
 """
 import sys
+import signal
 import threading
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -12,10 +13,10 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 
 from live_translator.audio import AudioCapture
-from live_translator.processing import Transcriber, Translator
+from live_translator.processing import Transcriber, Translator, WHISPER_MODELS
 from live_translator.ui import CaptionOverlay
 from live_translator.utils import get_settings, get_logger
-from live_translator.ai import QAAssistant
+from live_translator.ai import PROVIDERS, QAAssistant
 from live_translator.modes import ReverseTranslationMode
 
 
@@ -28,6 +29,8 @@ class LiveTranslatorApp(Gtk.Application):
         self.window = None
         self.audio_capture = None
         self.transcriber = None
+        self._transcriber_config = None
+        self._reloading = False
         self.translator = None
         self.qa_assistant = None
         self.reverse_mode = None  # Speech-to-speech translation
@@ -123,53 +126,49 @@ class LiveTranslatorApp(Gtk.Application):
 
         return False
 
+    def _transcription_config(self):
+        """Every setting the Transcriber is constructed from, as a comparable dict."""
+        return {
+            "model_size": self._get_setting("transcription", "whisper_model", self.args.whisper_model, "base"),
+            "device": self._get_setting("transcription", "device", self.args.device, "cpu"),
+            "compute_type": self._get_setting("transcription", "compute_type", self.args.compute_type, "int8"),
+            "enable_diarization": self.settings.get("transcription", "enable_diarization", False),
+            "num_speakers": self.settings.get("transcription", "num_speakers", None),
+            "min_audio_length": self.settings.get("transcription", "min_audio_length", 0.5),
+            "beam_size": self.settings.get("transcription", "beam_size", 3),
+            "min_silence_duration_ms": self.settings.get("transcription", "min_silence_duration_ms", 300),
+            "speech_pad_ms": self.settings.get("transcription", "speech_pad_ms", 100),
+            "no_speech_threshold": self.settings.get("transcription", "no_speech_threshold", 0.4),
+        }
+
+    def _build_transcriber(self, config):
+        """Construct a Transcriber, warning first if the weights must be downloaded."""
+        from live_translator.processing.whisper_models import is_model_cached
+        model = config["model_size"]
+        if not is_model_cached(model):
+            GLib.idle_add(self.window.set_status,
+                          f"Downloading Whisper '{model}' (first use, up to a few GB) — "
+                          "this can take several minutes")
+        else:
+            GLib.idle_add(self.window.set_status,
+                          f"Loading Whisper model '{model}' on {config['device']}...")
+        return Transcriber(**config)
+
     def _initialize(self):
         try:
-            # Get settings
-            whisper_model = self._get_setting("transcription", "whisper_model",
-                self.args.whisper_model if self.args.whisper_model != "base" else None, "base")
-            device = self._get_setting("transcription", "device",
-                self.args.device if self.args.device != "cpu" else None, "cpu")
-            compute_type = self._get_setting("transcription", "compute_type",
-                self.args.compute_type if self.args.compute_type != "int8" else None, "int8")
-            source_lang = self._get_setting("transcription", "source_language",
-                self.args.source_language if self.args.source_language != "en" else None, "en")
-
-            # Diarization settings (local - no token required)
-            enable_diarization = self.settings.get("transcription", "enable_diarization", False)
-            num_speakers = self.settings.get("transcription", "num_speakers", None)
-
-            # Performance optimization settings
-            min_audio_length = self.settings.get("transcription", "min_audio_length", 0.5)
-            beam_size = self.settings.get("transcription", "beam_size", 3)
-            min_silence_duration_ms = self.settings.get("transcription", "min_silence_duration_ms", 300)
-            speech_pad_ms = self.settings.get("transcription", "speech_pad_ms", 100)
-            no_speech_threshold = self.settings.get("transcription", "no_speech_threshold", 0.4)
-
-            # Initialize transcriber
-            GLib.idle_add(self.window.set_status, f"Loading Whisper model '{whisper_model}'...")
-            self.transcriber = Transcriber(
-                model_size=whisper_model,
-                device=device,
-                compute_type=compute_type,
-                enable_diarization=enable_diarization,
-                num_speakers=num_speakers,
-                min_audio_length=min_audio_length,
-                beam_size=beam_size,
-                min_silence_duration_ms=min_silence_duration_ms,
-                speech_pad_ms=speech_pad_ms,
-                no_speech_threshold=no_speech_threshold
-            )
+            config = self._transcription_config()
+            source_lang = self._get_setting("transcription", "source_language", self.args.source_language, "en")
+            self.transcriber = self._build_transcriber(config)
+            self._transcriber_config = config
             self.source_language = source_lang
-            self.diarization_enabled = enable_diarization and self.transcriber.enable_diarization
+            self.diarization_enabled = (config["enable_diarization"]
+                                        and self.transcriber.enable_diarization)
 
             # Initialize translator
             GLib.idle_add(self.window.set_status, "Initializing translator...")
-            provider = self._get_setting("translation", "provider", None, "ollama")
-            model = self._get_setting("translation", "model",
-                self.args.ollama_model if self.args.ollama_model != "mistral:7b" else None, "mistral:7b")
-            target_lang = self._get_setting("translation", "target_language",
-                self.args.target_language if self.args.target_language != "Russian" else None, "Russian")
+            provider = self._get_setting("translation", "provider", self.args.provider, "ollama")
+            model = self._get_setting("translation", "model", self.args.model, "mistral:7b")
+            target_lang = self._get_setting("translation", "target_language", self.args.target_language, "Russian")
             prompt = self.settings.get("translation", "prompt")
 
             self.translator = Translator(
@@ -184,6 +183,7 @@ class LiveTranslatorApp(Gtk.Application):
                 GLib.idle_add(self.window.set_status, "Initializing AI Assistant...")
                 ai_provider = self._get_setting("ai_assistant", "provider", None, "ollama")
                 if self.settings.get("ai_assistant", "use_translation_model", True):
+                    ai_provider = provider
                     ai_model = model
                 else:
                     ai_model = self._get_setting("ai_assistant", "model", None, "mistral:7b")
@@ -325,7 +325,7 @@ class LiveTranslatorApp(Gtk.Application):
                 whisper_model=whisper_model,
                 whisper_device=whisper_device,
                 whisper_compute_type=whisper_compute,
-                translator_provider="ollama",
+                translator_provider=self.settings.get("translation", "provider", "ollama"),
                 translator_model=translator_model,
                 source_language=source_lang,
                 target_language=target_lang,
@@ -395,7 +395,12 @@ class LiveTranslatorApp(Gtk.Application):
 
     def _translate_and_display(self, text):
         """Translate text and update display."""
+        if self.translator.provider == "none":
+            GLib.idle_add(self.window.set_status, "Transcription only — translation disabled")
+            return
         translated = self.translator.translate(text)
+        if not translated and self.translator.last_error:
+            GLib.idle_add(self.window.set_status, self.translator.last_error)
         if translated:
             GLib.idle_add(self.window.set_translated_text, translated)
             self.logger.log_translated(translated)
@@ -503,8 +508,9 @@ class LiveTranslatorApp(Gtk.Application):
             else:
                 ai_model = settings.get("ai_assistant", "model", "mistral:7b")
 
+            ai_category = "translation" if settings.get("ai_assistant", "use_translation_model", True) else "ai_assistant"
             self.qa_assistant.set_settings(
-                provider=settings.get("ai_assistant", "provider", "ollama"),
+                provider=settings.get(ai_category, "provider", "ollama"),
                 model=ai_model,
                 target_language=target_lang
             )
@@ -523,6 +529,9 @@ class LiveTranslatorApp(Gtk.Application):
             self.reverse_mode = None
         elif self.reverse_mode:
             # Update reverse mode settings
+            self.reverse_mode.translator.set_settings(
+                provider=settings.get("translation", "provider", "ollama"),
+                model=settings.get("translation", "model", ""))
             self.reverse_mode.update_settings(
                 source_language=settings.get("reverse_translation", "source_language", "Russian"),
                 target_language=settings.get("reverse_translation", "target_language", "English"),
@@ -530,7 +539,44 @@ class LiveTranslatorApp(Gtk.Application):
                 tts_speed=settings.get("reverse_translation", "tts_speed", 1.0)
             )
         
-        print("Settings updated. Note: Transcription settings require restart.")
+        self.source_language = self._get_setting(
+            "transcription", "source_language", self.args.source_language, "en")
+        self._reload_transcriber_if_needed()
+
+    def _reload_transcriber_if_needed(self):
+        """Rebuild the transcriber in the background when its settings changed."""
+        if not self.transcriber:
+            return
+        config = self._transcription_config()
+        if config == getattr(self, "_transcriber_config", None) or self._reloading:
+            return
+        self._reloading = True
+
+        def worker():
+            try:
+                transcriber = self._build_transcriber(config)
+            except Exception as exc:
+                # Keep the working transcriber rather than leaving the app deaf.
+                GLib.idle_add(self.window.set_status,
+                              f"Could not apply transcription settings: {exc}. "
+                              "Previous model still running.")
+                self._reloading = False
+                return
+            GLib.idle_add(finish, transcriber)
+
+        def finish(transcriber):
+            # Swapping a fully built object is atomic for the processing loop.
+            self.transcriber = transcriber
+            self._transcriber_config = config
+            self.diarization_enabled = (config["enable_diarization"]
+                                        and transcriber.enable_diarization)
+            self._reloading = False
+            self.window.set_status(
+                f"Transcription now using {config['model_size']} "
+                f"({config['compute_type']}) on {config['device']}")
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def do_shutdown(self):
         self.running = False
@@ -553,45 +599,68 @@ class LiveTranslatorApp(Gtk.Application):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Live Translator")
+    parser = argparse.ArgumentParser(
+        description="Live Translator",
+        epilog="Options left unset fall back to the saved settings file, then to the defaults shown."
+    )
     parser.add_argument(
         "--whisper-model", "-w",
-        default="base",
-        choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+        choices=list(WHISPER_MODELS),
         help="Whisper model size (default: base)"
     )
     parser.add_argument(
-        "--ollama-model", "-m",
-        default="mistral:7b",
-        help="Ollama model for translation (default: mistral:7b)"
+        "--provider", "-p",
+        choices=list(PROVIDERS),
+        help="Translation provider; 'none' transcribes without translating (default: ollama)"
+    )
+    parser.add_argument(
+        "--model", "-m", "--ollama-model",
+        dest="model",
+        help="Model ID for the selected translation provider (default: mistral:7b)"
     )
     parser.add_argument(
         "--source-language", "-s",
-        default="en",
         help="Source language code (default: en)"
     )
     parser.add_argument(
         "--target-language", "-t",
-        default="Russian",
         help="Target language name (default: Russian)"
     )
     parser.add_argument(
         "--device", "-d",
-        default="cpu",
         choices=["cpu", "cuda"],
         help="Device for Whisper (default: cpu)"
     )
     parser.add_argument(
         "--compute-type",
-        default="int8",
         choices=["int8", "float16", "float32"],
         help="Compute type for Whisper (default: int8)"
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="Check dependencies, hardware and settings, print the report and exit. "
+             "Exit status 1 if anything would stop the app working."
     )
 
     args = parser.parse_args()
 
+    if args.check:
+        from live_translator.utils.diagnostics import run_checks, render, FAIL
+        results = run_checks()
+        print(render(results))
+        sys.exit(1 if any(r.status == FAIL for r in results) else 0)
+
     app = LiveTranslatorApp(args)
-    app.run(None)
+    # PyGObject's SIGINT helper unwinds badly when Ctrl+C lands inside a worker
+    # thread (a model download, say), so quit the app instead of raising there.
+    def interrupt(signum, frame):
+        print("\nStopping...")
+        GLib.idle_add(app.quit)
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        app.run(None)
+    except KeyboardInterrupt:
+        app.quit()
 
 
 if __name__ == "__main__":
